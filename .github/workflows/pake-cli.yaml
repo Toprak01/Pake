@@ -187,7 +187,9 @@ jobs:
           INPUT_TARGETS: ${{ inputs.targets }}
         run: |
           $args = $env:INPUT_URL, "--name", $env:INPUT_NAME
-
+          $args += "--show-system-tray"
+          $args += "--activation-shortcut", "Alt+Space"
+          
           # Empty environment variables are unset on Windows, so test for null too.
           if (-not [string]::IsNullOrEmpty($env:INPUT_ICON)) {
             $args += "--icon", $env:INPUT_ICON
