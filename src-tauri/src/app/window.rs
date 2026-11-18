@@ -98,10 +98,22 @@ impl MultiWindowState {
         let index = self.next_window_index.fetch_add(1, Ordering::Relaxed) + 1;
         format!("{SECONDARY_WINDOW_LABEL_PREFIX}{index}")
     }
+
+    fn next_popup_label(&self) -> String {
+        let index = self.next_window_index.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("{POPUP_WINDOW_LABEL_PREFIX}{index}")
+    }
 }
 
-/// Secondary windows (Cmd+N clones, `--new-window` popups, blank two-stage
-/// popups) take `pake-N` labels. `capabilities/default.json` must cover them
+/// Windows a page opened take `pake-popup-N` labels: still under the
+/// `pake-*` capability glob, and apart from the Cmd+N clones' `pake-N`, so
+/// the window-state plugin can leave them out. A sign-in popup's size is the
+/// page's to choose every time, and a clone that later takes the same label
+/// must not open at the size of a sign-in popup.
+pub const POPUP_WINDOW_LABEL_PREFIX: &str = "pake-popup-";
+
+/// Secondary windows take labels under `pake-`: Cmd+N clones `pake-N`, and
+/// windows a page opened `pake-popup-N`. `capabilities/default.json` must cover them
 /// with a matching glob: an uncovered label has every IPC call denied, so
 /// external links, downloads and toasts silently stop working there.
 const SECONDARY_WINDOW_LABEL_PREFIX: &str = "pake-";
@@ -124,6 +136,8 @@ mod capability_tests {
 
         assert!(webviews.contains(&"pake"));
         assert!(webviews.contains(&format!("{SECONDARY_WINDOW_LABEL_PREFIX}*").as_str()));
+        // The one glob covers page-opened popups as well.
+        assert!(super::POPUP_WINDOW_LABEL_PREFIX.starts_with(SECONDARY_WINDOW_LABEL_PREFIX));
     }
 }
 
@@ -259,7 +273,7 @@ fn open_requested_window(
     features: NewWindowFeatures,
 ) -> tauri::Result<WebviewWindow> {
     let state = app.state::<MultiWindowState>();
-    let label = state.next_window_label();
+    let label = state.next_popup_label();
     let window = build_window(
         app,
         config,
@@ -272,8 +286,10 @@ fn open_requested_window(
         },
     )?;
 
-    let title = target_url.host_str().unwrap_or(target_url.as_str());
-    let _ = window.set_title(title);
+    // A blank popup keeps the app's title until its page has one.
+    if let Some(host) = target_url.host_str() {
+        let _ = window.set_title(host);
+    }
     reapply_window_icon(&window);
     let _ = window.set_focus();
 
@@ -465,6 +481,9 @@ fn build_window(
         visible,
         new_window_features,
     } = opts;
+    // A window a page opened: a sign-in popup, a blank two-stage one.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let page_popup = new_window_features.is_some();
     #[cfg(target_os = "macos")]
     let use_native_window_tabbing = config.multi_window && new_window_features.is_none();
     #[cfg(target_os = "macos")]
@@ -546,6 +565,27 @@ fn build_window(
         )
     } else {
         url
+    };
+
+    // With content blocking the main window starts blank, like the auth
+    // delegate above, and opens its page once the rule lists are in place.
+    #[cfg(all(
+        any(target_os = "macos", target_os = "linux"),
+        feature = "content-blocking"
+    ))]
+    let blocking_groups = crate::app::content_blocking::selected_groups(&config.content_blocking);
+    #[cfg(all(
+        any(target_os = "macos", target_os = "linux"),
+        feature = "content-blocking"
+    ))]
+    let (url, blocked_target) = match web_target(&url) {
+        Some(target) if label == "pake" && !blocking_groups.is_empty() => (
+            WebviewUrl::CustomProtocol(
+                Url::parse("about:blank").expect("about:blank must be a valid URL"),
+            ),
+            Some(target),
+        ),
+        _ => (url, None),
     };
 
     let user_agent = config.user_agent.get();
@@ -858,6 +898,15 @@ fn build_window(
         prepare_macos_new_window_configuration(&features)?;
 
         window_builder = window_builder.window_features(features).focused(true);
+        // A popup that starts blank and is then sent to its address has no
+        // title of its own; it takes its page's, as a browser's popup does.
+        window_builder = window_builder.on_document_title_changed(|window, title| {
+            if !title.trim().is_empty() {
+                if let Err(error) = window.set_title(&title) {
+                    eprintln!("[Pake] Failed to update the popup title: {error}");
+                }
+            }
+        });
     }
 
     // Capture webview-initiated downloads (blob:, data:, Content-Disposition,
@@ -964,6 +1013,18 @@ fn build_window(
         }
     }
 
+    // Before download::install navigates: WebView2 only raises request events
+    // for filters added ahead of the first navigation.
+    #[cfg(all(target_os = "windows", feature = "content-blocking"))]
+    if !config.content_blocking.is_empty() {
+        let names = config.content_blocking.clone();
+        if let Err(error) = window.with_webview(move |webview| {
+            crate::app::content_blocking::install(&webview, &names);
+        }) {
+            eprintln!("[Pake] Failed to access WebView2 for content blocking: {error}");
+        }
+    }
+
     #[cfg(target_os = "windows")]
     crate::app::download::install(&window, download_target)?;
 
@@ -974,6 +1035,33 @@ fn build_window(
         crate::app::recovery::install(&webview);
     }) {
         eprintln!("[Pake] Failed to access WebKitGTK for media permissions and recovery: {error}");
+    }
+
+    // Every webview passes here, popups included, whose content controller
+    // macOS replaces (prepare_macos_new_window_configuration), so each gets the lists.
+    #[cfg(all(
+        any(target_os = "macos", target_os = "linux"),
+        feature = "content-blocking"
+    ))]
+    if !blocking_groups.is_empty() {
+        #[cfg(target_os = "linux")]
+        if let Ok(directory) = app.path().app_data_dir() {
+            crate::app::content_blocking::set_store_dir(directory);
+        }
+        let groups = blocking_groups.clone();
+        let opener = window.clone();
+        if let Err(error) = window.with_webview(move |webview| {
+            crate::app::content_blocking::install(&webview, groups);
+            if let Some(target) = blocked_target {
+                crate::app::content_blocking::when_ready(Box::new(move || {
+                    if let Err(error) = opener.navigate(target) {
+                        eprintln!("[Pake] Failed to open the page: {error}");
+                    }
+                }));
+            }
+        }) {
+            eprintln!("[Pake] Failed to access the webview for content blocking: {error}");
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -992,12 +1080,72 @@ fn build_window(
         eprintln!("[Pake] Failed to access WKWebView for history swipe gestures: {error}");
     }
 
+    // A popup's page closes it with window.close() once it has answered its
+    // opener, and WKWebView closes nothing unless its UI delegate does.
+    #[cfg(target_os = "macos")]
+    if page_popup {
+        let popup_app = app.clone();
+        let popup_label = label.to_string();
+        if let Err(error) = window.with_webview(move |webview| {
+            crate::app::popup_close::install(&popup_app, &popup_label, &webview);
+        }) {
+            eprintln!("[Pake] Failed to access WKWebView for its popup close: {error}");
+        }
+    }
+
+    // WebView2 raises WindowCloseRequested for the same call, and Wry answers
+    // by destroying the web view's own container, which left the popup's frame
+    // on screen with nothing in it (measured in a Windows 11 VM).
+    #[cfg(target_os = "windows")]
+    if page_popup {
+        let popup = window.clone();
+        if let Err(error) = window.with_webview(move |webview| {
+            use webview2_com::WindowCloseRequestedEventHandler;
+            let result = unsafe {
+                (move || -> windows_core::Result<()> {
+                    let core = webview.controller().CoreWebView2()?;
+                    let mut token = 0;
+                    core.add_WindowCloseRequested(
+                        &WindowCloseRequestedEventHandler::create(Box::new(move |_, _| {
+                            if let Err(error) = popup.close() {
+                                eprintln!(
+                                    "[Pake] Failed to close the popup its page closed: {error}"
+                                );
+                            }
+                            Ok(())
+                        })),
+                        &mut token,
+                    )
+                })()
+            };
+            if let Err(error) = result {
+                eprintln!("[Pake] Failed to watch for a popup closing itself: {error}");
+            }
+        }) {
+            eprintln!("[Pake] Failed to access WebView2 for its popup close: {error}");
+        }
+    }
+
+    // A page's alert(), confirm() and prompt() show nothing in a WKWebView
+    // unless its UI delegate answers, and Wry's does not: every window's does.
+    #[cfg(target_os = "macos")]
+    if let Err(error) = window.with_webview(|webview| {
+        crate::app::script_dialogs::install(&webview);
+    }) {
+        eprintln!("[Pake] Failed to access WKWebView for its script dialogs: {error}");
+    }
+
     // The tab bar's + button exists only while some window class answers
     // `newWindowForTab:`. Install it for every tabbing window, the main one
     // included: its tab bar is the one the user sees first.
     #[cfg(target_os = "macos")]
     if use_native_window_tabbing {
         crate::app::tab_bar::install_new_tab_action(app, &window);
+    }
+
+    #[cfg(target_os = "macos")]
+    if window_config.navigation_buttons {
+        crate::app::nav_buttons::install(app, &window);
     }
 
     // A shared identifier alone leaves each NSWindow in automatic mode.
@@ -1035,7 +1183,11 @@ fn build_window(
         let prompt_for_basic_auth = config.basic_auth;
         let allow_invalid_certificates = window_config.ignore_certificate_errors;
         let auth_window = window.clone();
-        Queue::main().exec_async(move || {
+        #[cfg(feature = "content-blocking")]
+        let wait_for_lists = !blocking_groups.is_empty();
+        #[cfg(not(feature = "content-blocking"))]
+        let wait_for_lists = false;
+        let navigate = move || {
             if let Err(error) = auth_window.with_webview(move |webview| {
                 if !crate::app::auth::install_auth_delegate_and_navigate(
                     webview.inner(),
@@ -1049,10 +1201,33 @@ fn build_window(
             }) {
                 eprintln!("[Pake] Failed to access the macOS webview: {error}");
             }
+        };
+        Queue::main().exec_async(move || {
+            #[cfg(feature = "content-blocking")]
+            if wait_for_lists {
+                crate::app::content_blocking::when_ready(Box::new(navigate));
+                return;
+            }
+            let _ = wait_for_lists;
+            navigate();
         });
     }
 
     Ok(window)
+}
+
+/// The http or https page a window opens, whichever way its URL is held.
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux"),
+    feature = "content-blocking"
+))]
+fn web_target(url: &WebviewUrl) -> Option<Url> {
+    let target = match url {
+        WebviewUrl::External(target) => Some(target.clone()),
+        WebviewUrl::App(path) => path.to_str().and_then(|path| Url::parse(path).ok()),
+        _ => None,
+    }?;
+    matches!(target.scheme(), "http" | "https").then_some(target)
 }
 
 pub fn save_last_url(app: &AppHandle) {

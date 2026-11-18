@@ -4,6 +4,8 @@ pub mod autostart;
 #[cfg(any(target_os = "linux", test))]
 pub mod color_scheme;
 pub mod config;
+#[cfg(feature = "content-blocking")]
+pub mod content_blocking;
 #[cfg(target_os = "windows")]
 pub mod download;
 pub mod invoke;
@@ -11,10 +13,16 @@ pub mod invoke;
 pub mod media_permission;
 #[cfg(target_os = "macos")]
 pub mod menu;
+#[cfg(target_os = "macos")]
+pub mod nav_buttons;
 pub mod navigation;
 pub mod notification;
+#[cfg(target_os = "macos")]
+pub mod popup_close;
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
 pub mod recovery;
+#[cfg(target_os = "macos")]
+pub mod script_dialogs;
 pub mod setup;
 #[cfg(target_os = "macos")]
 pub mod tab_bar;
